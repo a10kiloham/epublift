@@ -26,11 +26,14 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use structured_zstd::decoding::FrameDecoder;
+use crate::MAX_TOTAL_UNCOMPRESSED;
+
+use structured_zstd::decoding::StreamingDecoder;
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -44,6 +47,21 @@ const ZSTD_LEVEL: i32 = 19;
 const MANIFEST_NAME: &str = "manifest.json";
 const STREAM_BLOB_NAME: &str = "data.zst";
 const MEDIA_PREFIX: &str = "media/";
+
+/// Cap on any `with_capacity` pre-reservation derived from an untrusted declared
+/// size (ZIP headers and the manifest are attacker-controlled; a huge claim must
+/// not turn into a huge allocation — the `Vec` grows on its own if the entry
+/// really is bigger).
+const MAX_PREALLOC: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Cap on `manifest.json` itself (untrusted; a real manifest is a few KiB — a
+/// multi-GiB claim is an attack, not a book).
+const MAX_MANIFEST_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// A safe `with_capacity` hint from an untrusted declared size.
+fn prealloc_hint(declared: u64) -> usize {
+    declared.min(MAX_PREALLOC as u64) as usize
+}
 
 /// The `.eparc` manifest (serialized as human-readable `manifest.json`).
 #[derive(Serialize, Deserialize)]
@@ -239,10 +257,16 @@ pub fn restore_eparc(input: &Path, output: &Path) -> Result<RestoreStats> {
         .with_context(|| format!("Not a readable .eparc (zip): {}", input.display()))?;
 
     let manifest: Manifest = {
+        // The manifest's declared size is untrusted: read at most the cap + 1
+        // bytes and bail cleanly instead of buffering a multi-GiB entry.
         let mut s = String::new();
         zip.by_name(MANIFEST_NAME)
             .context("archive is missing manifest.json")?
+            .take(MAX_MANIFEST_SIZE + 1)
             .read_to_string(&mut s)?;
+        if s.len() as u64 > MAX_MANIFEST_SIZE {
+            bail!("corrupt archive: manifest.json exceeds {MAX_MANIFEST_SIZE} bytes");
+        }
         serde_json::from_str(&s).context("manifest.json is not valid")?
     };
     if manifest.format != "eparc" {
@@ -256,19 +280,44 @@ pub fn restore_eparc(input: &Path, output: &Path) -> Result<RestoreStats> {
         );
     }
 
-    // Decompress the solid stream blob once.
-    let stream_total: usize = manifest
-        .entries
-        .iter()
-        .filter(|e| e.store == Store::Stream)
-        .map(|e| e.size as usize)
-        .sum();
-    let data_zst = read_zip_entry(&mut zip, STREAM_BLOB_NAME)?;
-    let mut stream_buf = Vec::with_capacity(stream_total);
-    FrameDecoder::new()
-        .decode_all_to_vec(&data_zst, &mut stream_buf)
+    // Decompress the solid stream blob once. The manifest sizes are untrusted,
+    // so sum them with checked arithmetic, bound the total, and never let a
+    // declared size drive the allocation.
+    let mut stream_total: u64 = 0;
+    for e in manifest.entries.iter().filter(|e| e.store == Store::Stream) {
+        stream_total = stream_total
+            .checked_add(e.size)
+            .ok_or_else(|| anyhow::anyhow!("corrupt archive: manifest entry sizes overflow"))?;
+    }
+    if stream_total > MAX_TOTAL_UNCOMPRESSED {
+        bail!(
+            "corrupt archive: manifest declares {stream_total} stream bytes (limit {MAX_TOTAL_UNCOMPRESSED})"
+        );
+    }
+    // Total-uncompressed budget shared across every entry read, as in
+    // `extract_epub`: enforced against bytes actually read, since the header
+    // sizes are attacker-controlled.
+    let mut budget: u64 = MAX_TOTAL_UNCOMPRESSED;
+    let data_zst = read_zip_entry(&mut zip, STREAM_BLOB_NAME, &mut budget)?;
+    // Decode incrementally with a hard output cap: the compressed frame is
+    // attacker-controlled, so it must never expand past the validated total
+    // (a zstd bomb would otherwise balloon in memory BEFORE the length check).
+    let limit = stream_total.min(MAX_TOTAL_UNCOMPRESSED);
+    let decoder = StreamingDecoder::new(data_zst.as_slice())
         .map_err(|e| anyhow::anyhow!("failed to decompress {STREAM_BLOB_NAME}: {e:?}"))?;
-    if stream_buf.len() != stream_total {
+    let mut stream_buf = Vec::with_capacity(prealloc_hint(stream_total));
+    // Read at most `limit + 1` bytes; overshooting means a bomb.
+    let read = decoder
+        .take(limit + 1)
+        .read_to_end(&mut stream_buf)
+        .map_err(|e| anyhow::anyhow!("failed to decompress {STREAM_BLOB_NAME}: {e:?}"))?
+        as u64;
+    if read > limit {
+        bail!(
+            "corrupt archive: {STREAM_BLOB_NAME} expands past the decompression limit (possible zstd bomb)"
+        );
+    }
+    if stream_buf.len() as u64 != stream_total {
         bail!(
             "stream size mismatch (expected {stream_total}, got {}) — archive corrupt",
             stream_buf.len()
@@ -286,12 +335,26 @@ pub fn restore_eparc(input: &Path, output: &Path) -> Result<RestoreStats> {
     for entry in &manifest.entries {
         let data: Vec<u8> = match entry.store {
             Store::Stream => {
+                // `size` is untrusted; check it against what actually remains in
+                // the decoded stream instead of slicing blind (which would panic).
+                let remaining = stream_buf.len() - stream_off;
+                if entry.size > remaining as u64 {
+                    bail!(
+                        "corrupt archive: entry '{}' claims {} stream bytes but only {remaining} remain",
+                        entry.path,
+                        entry.size
+                    );
+                }
                 let end = stream_off + entry.size as usize;
                 let chunk = stream_buf[stream_off..end].to_vec();
                 stream_off = end;
                 chunk
             }
-            Store::Verbatim => read_zip_entry(&mut zip, &format!("{MEDIA_PREFIX}{}", entry.path))?,
+            Store::Verbatim => read_zip_entry(
+                &mut zip,
+                &format!("{MEDIA_PREFIX}{}", entry.path),
+                &mut budget,
+            )?,
         };
         let got = crc32_hex(&data);
         if got != entry.crc32 {
@@ -349,28 +412,98 @@ fn store_verbatim(name: &str) -> bool {
 /// Read every file entry of an in-memory EPUB zip, in archive order, as
 /// `(name, uncompressed-bytes)`.
 fn read_epub_entries(epub: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    // ZIPs may legally repeat a name, but this format cannot represent that:
+    // verbatim entries become colliding `media/{name}` paths and restore
+    // resolves by name, so one duplicate's bytes would be silently lost and
+    // the archived book could never restore content-exact. Refuse up front
+    // rather than archive unrecoverably. `ZipArchive` itself collapses
+    // duplicates (last one wins), so scan the raw central directory too.
+    if let Some(name) = duplicate_entry_name(epub) {
+        bail!("this EPUB has duplicate entry names ('{name}') and cannot be archived safely");
+    }
     let mut zip = ZipArchive::new(std::io::Cursor::new(epub))?;
     let mut out = Vec::with_capacity(zip.len());
+    // Total-uncompressed budget, matching `extract_epub` in lib.rs: enforced
+    // against bytes actually read, since header sizes are attacker-controlled.
+    let mut budget: u64 = MAX_TOTAL_UNCOMPRESSED;
+    // Belt and braces: also refuse duplicates as read, in case a future zip
+    // crate starts preserving them through `by_index`.
+    let mut seen: HashSet<String> = HashSet::with_capacity(zip.len());
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
         if !f.is_file() {
             continue;
         }
         let name = f.name().to_string();
-        let mut data = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut data)?;
+        if !seen.insert(name.clone()) {
+            bail!("this EPUB has duplicate entry names ('{name}') and cannot be archived safely");
+        }
+        let mut data = Vec::with_capacity(prealloc_hint(f.size()));
+        // Read at most `budget + 1` bytes; overshooting means a bomb.
+        let read = f.by_ref().take(budget + 1).read_to_end(&mut data)? as u64;
+        if read > budget {
+            bail!("EPUB is too large when decompressed (possible zip bomb).");
+        }
+        budget -= read;
         out.push((name, data));
     }
     Ok(out)
 }
 
-/// Read one named entry of an open archive fully into memory.
-fn read_zip_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
+/// Best-effort scan of a ZIP's central directory for a repeated entry name.
+///
+/// Needed because `ZipArchive` silently collapses duplicate names (the last
+/// one wins), so the indexed read alone can never see them. Walks the plain
+/// (non-zip64) end-of-central-directory record; that covers every EPUB this
+/// tool accepts, since `MAX_TOTAL_UNCOMPRESSED` rejects zip64-sized books
+/// long before this matters. Returns `None` when the directory can't be
+/// walked — the untrusted bytes then still face the zip crate's own parser.
+fn duplicate_entry_name(epub: &[u8]) -> Option<String> {
+    const EOCD_SIG: &[u8; 4] = b"PK\x05\x06"; // end of central directory
+    const CDH_SIG: &[u8; 4] = b"PK\x01\x02"; // central directory header
+    let eocd = epub.windows(4).rposition(|w| w == EOCD_SIG)?;
+    let rec = epub.get(eocd..eocd + 22)?;
+    let count = u16::from_le_bytes([rec[10], rec[11]]) as usize;
+    let cd_size = u32::from_le_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
+    // Derive the directory start from the EOCD position rather than trusting
+    // the stored offset (this also tolerates data prepended to the ZIP).
+    let mut pos = eocd.checked_sub(cd_size)?;
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let hdr = epub.get(pos..pos + 46)?;
+        if &hdr[..4] != CDH_SIG {
+            return None;
+        }
+        let name_len = u16::from_le_bytes([hdr[28], hdr[29]]) as usize;
+        let extra_len = u16::from_le_bytes([hdr[30], hdr[31]]) as usize;
+        let comment_len = u16::from_le_bytes([hdr[32], hdr[33]]) as usize;
+        let name = epub.get(pos + 46..pos + 46 + name_len)?;
+        if !seen.insert(name) {
+            return Some(String::from_utf8_lossy(name).into_owned());
+        }
+        pos = pos + 46 + name_len + extra_len + comment_len;
+    }
+    None
+}
+
+/// Read one named entry of an open archive fully into memory, drawing from a
+/// caller-held total-uncompressed `budget` (shared across calls so a crafted
+/// archive cannot expand past the cap; the header's declared size is untrusted).
+fn read_zip_entry<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    name: &str,
+    budget: &mut u64,
+) -> Result<Vec<u8>> {
     let mut e = zip
         .by_name(name)
         .with_context(|| format!("archive is missing '{name}'"))?;
-    let mut data = Vec::with_capacity(e.size() as usize);
-    e.read_to_end(&mut data)?;
+    let mut data = Vec::with_capacity(prealloc_hint(e.size()));
+    // Read at most `budget + 1` bytes; overshooting means a bomb.
+    let read = e.by_ref().take(*budget + 1).read_to_end(&mut data)? as u64;
+    if read > *budget {
+        bail!("corrupt archive: entries expand past the decompression limit (possible zip bomb)");
+    }
+    *budget -= read;
     Ok(data)
 }
 
@@ -379,6 +512,10 @@ fn read_zip_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) 
 fn detect_epub_version(entries: &[(String, Vec<u8>)]) -> Option<String> {
     let (_, opf) = entries.iter().find(|(n, _)| n.ends_with(".opf"))?;
     let xml = std::str::from_utf8(opf).ok()?;
+    // Bound nesting before the recursive parse (stack-overflow guard).
+    if !crate::util::xml_nesting_ok(xml, 256) {
+        return None;
+    }
     let doc = roxmltree::Document::parse(xml).ok()?;
     doc.descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "package")
@@ -489,6 +626,104 @@ mod tests {
         assert_eq!(
             original, restored,
             "restored EPUB must be byte-identical to the original, entry for entry"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_absurd_manifest_sizes() {
+        // A manifest declaring a 1 TiB streamed entry must fail cleanly — no
+        // giant allocation, no panic, just a "corrupt archive" error.
+        let dir = tempfile::tempdir().unwrap();
+        let epub_path = dir.path().join("book.epub");
+        std::fs::write(&epub_path, sample_epub()).unwrap();
+        let eparc_path = dir.path().join("book.eparc");
+        archive_epub(&epub_path, &eparc_path).unwrap();
+
+        // Re-write the archive with the poisoned size in its manifest.
+        let bytes = std::fs::read(&eparc_path).unwrap();
+        let mut zip = ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let mut manifest: Manifest = {
+            let mut s = String::new();
+            zip.by_name(MANIFEST_NAME)
+                .unwrap()
+                .read_to_string(&mut s)
+                .unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+        let streamed = manifest
+            .entries
+            .iter_mut()
+            .find(|e| e.store == Store::Stream)
+            .unwrap();
+        streamed.size = 1 << 40; // 1 TiB
+        let evil_path = dir.path().join("evil.eparc");
+        {
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let mut w = ZipWriter::new(File::create(&evil_path).unwrap());
+            for i in 0..zip.len() {
+                let mut f = zip.by_index(i).unwrap();
+                let name = f.name().to_string();
+                w.start_file(&name, stored).unwrap();
+                if name == MANIFEST_NAME {
+                    w.write_all(&serde_json::to_vec_pretty(&manifest).unwrap())
+                        .unwrap();
+                } else {
+                    let mut data = Vec::new();
+                    f.read_to_end(&mut data).unwrap();
+                    w.write_all(&data).unwrap();
+                }
+            }
+            w.finish().unwrap();
+        }
+
+        let err = match restore_eparc(&evil_path, &dir.path().join("out.epub")) {
+            Ok(_) => panic!("restore must reject the poisoned manifest"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("corrupt archive"),
+            "expected a clean corrupt-archive error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn archive_rejects_duplicate_entry_names() {
+        // ZipWriter refuses duplicate names, so write two same-length names and
+        // byte-patch the second into the first (names live uncompressed in the
+        // local + central headers; stored contents avoid the needle). Real
+        // tools do emit such EPUBs, and archiving one would silently lose the
+        // shadowed entry's bytes — it must be refused.
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("mimetype", stored).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("OEBPS/ch1.xhtml", stored).unwrap();
+            zip.write_all(b"<html>first</html>").unwrap();
+            zip.start_file("OEBPS/ch9.xhtml", stored).unwrap();
+            zip.write_all(b"<html>second, different bytes</html>")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let needle = b"ch9.xhtml";
+        for i in 0..buf.len() - needle.len() {
+            if &buf[i..i + needle.len()] == needle {
+                buf[i..i + needle.len()].copy_from_slice(b"ch1.xhtml");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let epub_path = dir.path().join("dupes.epub");
+        std::fs::write(&epub_path, buf).unwrap();
+
+        let err = match archive_epub(&epub_path, &dir.path().join("dupes.eparc")) {
+            Ok(_) => panic!("archiving an EPUB with duplicate entry names must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate entry names") && msg.contains("OEBPS/ch1.xhtml"),
+            "expected a clear duplicate-name error, got: {msg}"
         );
     }
 

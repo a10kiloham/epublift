@@ -45,6 +45,29 @@ learns *whether* a key exists and which providers are available, never the key.
 The provider is a dropdown so more (Claude, GPT, …) can be added later without
 UI changes.
 
+## The cleanup pass
+
+Raw OCR output carries print-layout artifacts: page numbers, running
+headers/footers, stray garbled characters, and footnotes detached from their
+markers. After OCR, Smart Import sends the text (in chunks of whole pages) to a
+Mistral **chat** model with instructions to:
+
+- strip gibberish and errant characters (including rejoining hyphenated words),
+- remove hard-coded page numbers and repeated running headers/footers,
+- convert footnote markers into **linked Markdown footnotes** (`[^n]` +
+  definitions), which the Markdown importer renders as tappable,
+  backlinked notes in the EPUB,
+- leave image references untouched.
+
+The pass is **best-effort and lossless by construction**: any chunk whose
+cleanup call fails, or whose answer looks truncated, keeps its raw OCR text.
+
+Configuration (server environment):
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `MISTRAL_CLEANUP_MODEL` | `mistral-small-latest` | Chat model used for cleanup. Set to `off` to skip the pass and keep raw OCR text. |
+
 ## Privacy & cost
 
 - The uploaded PDF is sent to the selected provider for OCR. **This leaves your

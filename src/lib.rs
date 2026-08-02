@@ -296,6 +296,10 @@ fn opf_entry_name(zip: &mut ZipArchive<File>) -> Result<String> {
         e.read_to_string(&mut s)?;
         s
     };
+    // Bound nesting before the recursive parse (stack-overflow guard).
+    if !util::xml_nesting_ok(&container, 256) {
+        bail!("container.xml is nested too deeply");
+    }
     let doc = roxmltree::Document::parse(&container).context("Failed to parse container.xml")?;
     doc.descendants()
         .find(|n| {
@@ -662,6 +666,11 @@ fn locate_opf(temp_dir: &Path) -> Result<PathBuf> {
         .context("Could not find rootfile element in container.xml")?;
 
     let full_path = rootfile.attribute("full-path").unwrap();
+    // `full-path` is attacker-controlled; a value escaping the extraction dir
+    // would make later OPF rewrites overwrite arbitrary files.
+    if !util::is_contained_path(full_path) {
+        bail!("Invalid EPUB: container.xml full-path escapes the container.");
+    }
     Ok(temp_dir.join(full_path))
 }
 

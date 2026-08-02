@@ -24,6 +24,28 @@ services:
     environment:
       - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY:-}
       - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      # Model for the Smart Import cleanup pass (gibberish/page numbers/footnotes);
+      # set to `off` to skip cleanup and keep the raw OCR text.
+      - MISTRAL_CLEANUP_MODEL=${MISTRAL_CLEANUP_MODEL:-}
+      # Log verbosity for stdout (`docker logs`); see .env.example.
+      - RUST_LOG=${RUST_LOG:-}
+      # File logs land in the mounted ./logs volume below (WARN+ by default;
+      # tune with EPUBLIFT_FILE_LOG=info for full operational logs on disk).
+      - EPUBLIFT_LOG_DIR=/logs
+      - EPUBLIFT_FILE_LOG=${EPUBLIFT_FILE_LOG:-}
+
+    # --- logging ---
+    # Rolling daily WARN+ file logs, persisted on the host. The container runs
+    # as uid 10001, so give it ownership once:  mkdir -p logs && sudo chown
+    # 10001 logs  (without it the service still runs, logging to stdout only).
+    volumes:
+      - ./logs:/logs
+    # Keep `docker logs` bounded so a chatty day can't fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     # --- hardening ---
     read_only: true            # immutable root filesystem

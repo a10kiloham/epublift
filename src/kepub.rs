@@ -69,8 +69,14 @@ pub fn kobo_spanify(root: &Path, progress: &dyn Fn(&str)) -> Result<()> {
 /// original file intact.
 fn transform_file(path: &Path) -> Result<()> {
     let raw = fs::read(path)?;
-    let content = String::from_utf8_lossy(&raw);
-    let out = spanify(&content)?;
+    // Never transform non-UTF-8 content: a lossy conversion would replace
+    // every non-ASCII byte with U+FFFD and write the corruption back. Bail so
+    // the caller warns and the file is left untouched.
+    let content = match std::str::from_utf8(&raw) {
+        Ok(s) => s,
+        Err(_) => anyhow::bail!("file is not valid UTF-8; leaving it untouched"),
+    };
+    let out = spanify(content)?;
     fs::write(path, out)?;
     Ok(())
 }
@@ -389,5 +395,34 @@ mod tests {
         let out = run("<html><head></head><body><p>A&amp;B and 3.14 stay.</p></body></html>");
         // Entity survives verbatim; "3.14" is not split into two sentences.
         assert!(out.contains("A&amp;B and 3.14 stay."));
+    }
+
+    #[test]
+    fn non_utf8_file_is_skipped_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.xhtml");
+        // Latin-1 "café" (0xE9): not valid UTF-8.
+        let original: Vec<u8> = b"<html><body><p>caf\xE9</p></body></html>".to_vec();
+        fs::write(&path, &original).unwrap();
+
+        let warnings = std::cell::RefCell::new(Vec::new());
+        kobo_spanify(dir.path(), &|msg| {
+            warnings.borrow_mut().push(msg.to_owned())
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "non-UTF-8 file must be left byte-identical"
+        );
+        assert!(
+            warnings
+                .borrow()
+                .iter()
+                .any(|w| w.contains("latin1.xhtml") && w.contains("not valid UTF-8")),
+            "expected a warning naming the file: {:?}",
+            warnings.borrow()
+        );
     }
 }

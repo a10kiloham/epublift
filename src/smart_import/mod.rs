@@ -98,16 +98,33 @@ pub fn import(
     let ocr = match opts.provider {
         Provider::Mistral => mistral::ocr(&opts.api_key, pdf)?,
     };
-    if ocr.markdown.trim().is_empty() {
+    if ocr.stitched().trim().is_empty() {
         bail!("the OCR service returned no text for this PDF");
     }
+
+    // Second pass: have the provider clean the raw OCR text (gibberish, printed
+    // page numbers, footnote linking). Best-effort — the raw text is kept when
+    // cleanup fails or is disabled (MISTRAL_CLEANUP_MODEL=off).
+    let markdown = match opts.provider {
+        Provider::Mistral => match mistral::cleanup(&opts.api_key, &ocr.pages) {
+            Ok(Some(cleaned)) if !cleaned.trim().is_empty() => cleaned,
+            Ok(Some(_)) | Ok(None) => ocr.stitched(),
+            Err(e) => {
+                eprintln!(
+                    "[EXPERIMENTAL] warning: OCR cleanup pass failed ({e:#}); \
+                     using the raw OCR text"
+                );
+                ocr.stitched()
+            }
+        },
+    };
 
     for (name, bytes) in &ocr.images {
         std::fs::write(workdir.join(name), bytes)
             .with_context(|| format!("failed to write OCR image {name}"))?;
     }
     let md_path = workdir.join("book.md");
-    std::fs::write(&md_path, &ocr.markdown).context("failed to write OCR markdown")?;
+    std::fs::write(&md_path, &markdown).context("failed to write OCR markdown")?;
 
     let md_opts = crate::markdown::ImportOptions {
         language: opts.language.clone(),

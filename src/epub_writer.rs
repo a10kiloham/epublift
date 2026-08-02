@@ -165,10 +165,10 @@ pub(crate) fn package_epub(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <dc:identifier id="bookid">urn:uuid:epublift-import-{n}</dc:identifier>
+  <dc:identifier id="bookid">{ident}</dc:identifier>
   <dc:title>{title}</dc:title>
   <dc:language>{lang}</dc:language>
-  <meta property="dcterms:modified">2026-01-01T00:00:00Z</meta>
+  <meta property="dcterms:modified">{modified}</meta>
 {cover_meta} </metadata>
  <manifest>
   <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
@@ -176,9 +176,10 @@ pub(crate) fn package_epub(
  <spine>
 {spine} </spine>
 </package>"#,
-            n = chapters.len(),
+            ident = book_identifier(title, chapters),
             title = esc(title),
             lang = esc(language),
+            modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             cover_meta = cover_meta,
         )
         .as_bytes(),
@@ -188,11 +189,31 @@ pub(crate) fn package_epub(
     Ok(())
 }
 
-/// Escape text for inclusion in XHTML, dropping control chars illegal in XML 1.0.
+/// A unique-enough `dc:identifier` for an imported book: a hash of the content
+/// plus the wall clock. Readers and library apps key on this identifier, so
+/// two different imports must never collide (they'd overwrite each other in a
+/// library), and re-importing the same file should still yield a fresh id.
+fn book_identifier(title: &str, chapters: &[RenderedChapter]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut h);
+    for c in chapters {
+        c.title.hash(&mut h);
+        c.body.hash(&mut h);
+    }
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    format!("urn:epublift:{:016x}-{now:x}", h.finish())
+}
+
+/// Escape text for inclusion in XHTML, dropping chars illegal in XML 1.0.
 pub(crate) fn esc(s: &str) -> String {
     s.chars()
-        // Drop control chars that are illegal in XML 1.0 (keep tab/newline/CR).
-        .filter(|&c| c >= ' ' || c == '\t' || c == '\n' || c == '\r')
+        // Drop control chars that are illegal in XML 1.0 (keep tab/newline/CR),
+        // plus the non-characters U+FFFE/U+FFFF (XML 1.0 excludes them too, and
+        // lossy PDF text extraction can produce them).
+        .filter(|&c| {
+            (c >= ' ' || c == '\t' || c == '\n' || c == '\r') && c != '\u{FFFE}' && c != '\u{FFFF}'
+        })
         .map(|c| match c {
             '&' => "&amp;".into(),
             '<' => "&lt;".into(),
