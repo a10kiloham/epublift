@@ -26,8 +26,10 @@
 //     it is explicitly non-standard (ZIP has no slot for a shared dictionary —
 //     storing it as a named entry is our concrete proposal for the W3C thread).
 
+use std::io::Read;
+
 use anyhow::{Result, bail};
-use structured_zstd::decoding::FrameDecoder;
+use structured_zstd::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_source,
 };
@@ -357,6 +359,73 @@ fn parse_records(archive: &[u8]) -> Result<Vec<RawRecord>> {
     Ok(records)
 }
 
+/// Cap on any `with_capacity` pre-reservation derived from an untrusted
+/// declared size: the central directory's size fields are attacker-controlled,
+/// and a huge claim must not turn into a huge up-front allocation — the `Vec`
+/// grows on its own if an entry really is bigger. (Mirrors the private
+/// `prealloc_hint` in `eparc.rs`, which exists for the same reason.)
+const MAX_PREALLOC: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// A safe `with_capacity` hint from an untrusted declared size.
+fn prealloc_hint(declared: usize) -> usize {
+    declared.min(MAX_PREALLOC)
+}
+
+/// Deduct `n` produced bytes from the shared unpack budget, failing once the
+/// archive expands past [`crate::MAX_TOTAL_UNCOMPRESSED`] in total.
+fn charge_budget(budget: &mut u64, n: u64, name: &str) -> Result<()> {
+    if n > *budget {
+        bail!(
+            "archive expands past the {} byte total-uncompressed budget (at {name}); refusing to unpack",
+            crate::MAX_TOTAL_UNCOMPRESSED
+        );
+    }
+    *budget -= n;
+    Ok(())
+}
+
+/// Incrementally decompress one method-93 entry's payload (one or more zstd
+/// frames), charging every produced byte against the shared `budget` as it
+/// appears. The declared size is used only as a capped allocation hint — the
+/// caller verifies the actual decoded length against it afterwards.
+fn decode_zstd_entry(
+    dec: &mut FrameDecoder,
+    mut payload: &[u8],
+    dict: Option<&DictionaryHandle>,
+    declared: usize,
+    budget: &mut u64,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(prealloc_hint(declared));
+    let mut chunk = [0u8; 32 * 1024];
+    while !payload.is_empty() {
+        match dict {
+            Some(d) => dec.init_with_dict_handle(&mut payload, d),
+            None => dec.init(&mut payload),
+        }
+        .map_err(|e| anyhow::anyhow!("zstd decode failed for {name}: {e:?}"))?;
+        loop {
+            let finished = dec
+                .decode_blocks(&mut payload, BlockDecodingStrategy::UptoBytes(chunk.len()))
+                .map_err(|e| anyhow::anyhow!("zstd decode failed for {name}: {e:?}"))?;
+            loop {
+                let n = dec
+                    .read(&mut chunk)
+                    .map_err(|e| anyhow::anyhow!("zstd decode failed for {name}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                charge_budget(budget, n as u64, name)?;
+                out.extend_from_slice(&chunk[..n]);
+            }
+            if finished {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Parse a Zstd-OCF archive back into its uncompressed entries, in central
 /// directory order. Handles **both** per-entry and shared-dictionary archives:
 /// if a [`DICT_ENTRY`] is present, it is loaded first and applied to the
@@ -367,39 +436,58 @@ fn parse_records(archive: &[u8]) -> Result<Vec<RawRecord>> {
 pub fn unpack_zstd(archive: &[u8]) -> Result<Vec<OcfEntry>> {
     let records = parse_records(archive)?;
 
-    // First pass: load the shared dictionary, if this is a shared-dict archive.
-    let dict: Option<Vec<u8>> = records
+    // First pass: parse the shared dictionary, if this is a shared-dict archive.
+    let dict: Option<DictionaryHandle> = records
         .iter()
         .find(|r| r.name == DICT_ENTRY)
-        .map(|r| archive[r.payload_range.0..r.payload_range.1].to_vec());
+        .map(|r| {
+            DictionaryHandle::decode_dict(&archive[r.payload_range.0..r.payload_range.1])
+                .map_err(|e| anyhow::anyhow!("invalid shared dictionary entry: {e:?}"))
+        })
+        .transpose()?;
+
+    // Every size field in the central directory is attacker-controlled, so the
+    // total-uncompressed budget is enforced against bytes actually produced,
+    // never against declared sizes. (Same limit `extract_epub` uses in lib.rs.)
+    let mut budget: u64 = crate::MAX_TOTAL_UNCOMPRESSED;
 
     // Second pass: decode every entry except the dictionary itself.
     let mut entries = Vec::with_capacity(records.len());
+    let mut dec = FrameDecoder::new();
     for r in &records {
         if r.name == DICT_ENTRY {
             continue;
         }
         let payload = &archive[r.payload_range.0..r.payload_range.1];
         let data = match r.method {
-            METHOD_STORED => payload.to_vec(),
+            METHOD_STORED => {
+                charge_budget(&mut budget, payload.len() as u64, &r.name)?;
+                payload.to_vec()
+            }
             METHOD_ZSTD => {
-                let mut dec = FrameDecoder::new();
-                let mut out = vec![0u8; r.uncomp_size];
-                let written = match (&dict, is_dict_eligible(&r.name)) {
-                    (Some(d), true) => dec
-                        .decode_all_with_dict_bytes(payload, &mut out, d)
-                        .map_err(|e| {
-                            anyhow::anyhow!("zstd dict-decode failed for {}: {e:?}", r.name)
-                        })?,
-                    _ => dec
-                        .decode_all(payload, &mut out)
-                        .map_err(|e| anyhow::anyhow!("zstd decode failed for {}: {e:?}", r.name))?,
-                };
-                out.truncate(written);
-                out
+                let entry_dict = dict.as_ref().filter(|_| is_dict_eligible(&r.name));
+                decode_zstd_entry(
+                    &mut dec,
+                    payload,
+                    entry_dict,
+                    r.uncomp_size,
+                    &mut budget,
+                    &r.name,
+                )?
             }
             other => bail!("unsupported compression method {other} for {}", r.name),
         };
+
+        // The declared size was only an allocation hint above; anything that
+        // relies on it being exact must first see it match reality.
+        if data.len() != r.uncomp_size {
+            bail!(
+                "size mismatch for {}: header declares {} bytes, entry decodes to {}",
+                r.name,
+                r.uncomp_size,
+                data.len()
+            );
+        }
 
         let actual = crc32fast::hash(&data);
         if actual != r.crc {

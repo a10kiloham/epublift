@@ -28,6 +28,10 @@ use tower_http::timeout::TimeoutLayer;
 /// real defense — not obscurity.
 const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Smart Import gets its own, much longer budget: the OCR call plus the
+/// per-chunk cleanup calls for a whole book can take many minutes, and the
+/// global [`REQUEST_TIMEOUT`] would cut the request off mid-flight.
+const SMART_IMPORT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// AVIF encoder speed for the experimental 3.4 path. Faster than the CLI default
 /// (4) so an interactive request stays well under [`REQUEST_TIMEOUT`] even on a
 /// photo-heavy book — AVIF (rav1e) is slow at low speeds. Costs a little size.
@@ -137,13 +141,37 @@ async fn main() {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "epublift_web=info,tower_http=warn".into());
-    // Always log to stdout (so `docker logs` works); additionally write WARN+ to a
-    // rolling daily file in EPUBLIFT_LOG_DIR (default `logs/`) for local debugging.
-    // If that dir can't be created/written (e.g. the container's read-only cwd),
-    // fall back to stdout only rather than failing to start.
+    // Parse RUST_LOG defensively: an unset, empty, or invalid value falls back
+    // to the default filter instead of silently disabling all logging (an empty
+    // RUST_LOG in a compose file would otherwise mute the service).
+    const DEFAULT_FILTER: &str = "epublift_web=info,tower_http=warn";
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| match EnvFilter::try_new(&s) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("invalid RUST_LOG '{s}' ({e}); using '{DEFAULT_FILTER}'");
+                None
+            }
+        })
+        .unwrap_or_else(|| EnvFilter::new(DEFAULT_FILTER));
+    // Always log to stdout (so `docker logs` works); additionally write to a
+    // rolling daily file in EPUBLIFT_LOG_DIR (default `logs/`) for local
+    // debugging — WARN+ by default, tunable with EPUBLIFT_FILE_LOG (e.g. `info`
+    // to mirror operational logs into the file). If the dir can't be
+    // created/written (e.g. the container's read-only cwd), fall back to stdout
+    // only rather than failing to start.
     let log_dir = std::env::var("EPUBLIFT_LOG_DIR").unwrap_or_else(|_| "logs".into());
+    let file_level = std::env::var("EPUBLIFT_FILE_LOG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        // An empty value means "not set" (compose passes `${EPUBLIFT_FILE_LOG:-}`
+        // through as an empty string, which LevelFilter would parse as ERROR).
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::WARN);
     let _file_guard = match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
             let (writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
@@ -156,10 +184,10 @@ async fn main() {
                     fmt::layer()
                         .with_ansi(false)
                         .with_writer(writer)
-                        .with_filter(LevelFilter::WARN),
+                        .with_filter(file_level),
                 )
                 .init();
-            tracing::info!("writing WARN+ logs to {log_dir}/epublift-web.log");
+            tracing::info!("writing {file_level}+ logs to {log_dir}/epublift-web.log");
             Some(guard)
         }
         Err(e) => {
@@ -207,6 +235,14 @@ async fn main() {
         });
     }
 
+    // Smart Import lives on its own sub-router so it can carry a longer
+    // timeout than everything else (AI OCR + cleanup of a book is slow).
+    let smart = Router::new()
+        .route("/smart-import", post(smart_import))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            SMART_IMPORT_TIMEOUT,
+        ));
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -216,18 +252,18 @@ async fn main() {
         .route("/config", get(config))
         .route("/convert", post(convert))
         .route("/import", post(import))
-        .route("/smart-import", post(smart_import))
         .route("/archive", post(archive))
         .route("/restore", post(restore))
         .route("/meta/read", post(meta_read))
         .route("/meta/enrich", post(meta_enrich))
         .route("/meta/write", post(meta_write))
         .route("/download/{token}", get(download))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
+        .merge(smart)
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         // Security headers on every response.
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -471,6 +507,17 @@ async fn convert(
         .await
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server busy".into()))?;
 
+    // Only sizes/options/durations are logged — never upload names or content.
+    let started = Instant::now();
+    tracing::info!(
+        bytes = file_bytes.len(),
+        quality,
+        kepub,
+        image_format,
+        target = if target_34 { "3.4" } else { "3.3" },
+        "convert started"
+    );
+
     // Everything below happens in a throwaway temp dir that is deleted when this
     // task ends — on success or error. No upload is ever persisted or logged.
     let result =
@@ -530,7 +577,8 @@ async fn convert(
             Ok((resp, out_bytes))
         })
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            tracing::error!("convert task panicked: {e}");
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "conversion crashed".into(),
@@ -539,7 +587,18 @@ async fn convert(
 
     let (mut resp, out_bytes) = result
         // Most failures here are invalid/corrupt EPUBs -> client error.
-        .map_err(|e| bad_request(format!("could not convert this EPUB: {e}")))?;
+        .map_err(|e| {
+            tracing::warn!("convert failed: {e:#}");
+            bad_request(format!("could not convert this EPUB: {e}"))
+        })?;
+
+    tracing::info!(
+        original = resp.original_size,
+        r#final = resp.final_size,
+        saved_pct = format!("{:.1}", resp.saved_pct).as_str(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "convert completed"
+    );
 
     // Stash the result in memory for a single short-lived download.
     let token = uuid::Uuid::new_v4().to_string();
@@ -607,6 +666,13 @@ async fn import(
         .await
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server busy".into()))?;
 
+    let started = Instant::now();
+    tracing::info!(
+        kind = ext.as_str(),
+        bytes = file_bytes.len(),
+        "import started"
+    );
+
     // Throwaway temp dir, deleted when the task ends. No upload is persisted.
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(ImportResponse, Vec<u8>)> {
@@ -670,13 +736,25 @@ async fn import(
             Ok((resp, out_bytes))
         })
         .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "import crashed".into()))?;
+        .map_err(|e| {
+            tracing::error!("import task panicked: {e}");
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "import crashed".into())
+        })?;
 
     // Most failures are scans needing OCR, CID-font PDFs, bad Markdown, or the
     // wrong file type — surface the library's helpful message as a client error.
-    let (mut resp, out_bytes) =
-        result.map_err(|e| bad_request(format!("could not import this file: {e}")))?;
+    let (mut resp, out_bytes) = result.map_err(|e| {
+        tracing::warn!("import failed: {e:#}");
+        bad_request(format!("could not import this file: {e}"))
+    })?;
 
+    tracing::info!(
+        kind = resp.kind,
+        chapters = resp.chapters,
+        bytes = resp.final_size,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "import completed"
+    );
     resp.download_token = stash(
         &state,
         resp.output_name.clone(),
@@ -790,6 +868,7 @@ async fn smart_import(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "book".to_string());
 
+    let started = Instant::now();
     tracing::info!(
         provider = provider.id(),
         bytes = file_bytes.len(),
@@ -828,7 +907,8 @@ async fn smart_import(
             ))
         })
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            tracing::error!("smart import task panicked: {e}");
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "smart import crashed".into(),
@@ -836,7 +916,8 @@ async fn smart_import(
         })?;
 
     let (mut resp, out_bytes) = result.map_err(|e| {
-        tracing::warn!("smart import failed: {e}");
+        // `{e:#}` keeps the anyhow cause chain (e.g. the provider's HTTP error).
+        tracing::warn!("smart import failed: {e:#}");
         bad_request(format!("Smart Import failed: {e}"))
     })?;
 
@@ -845,6 +926,7 @@ async fn smart_import(
         chapters = resp.chapters,
         images = resp.images,
         bytes = out_bytes.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "smart import completed"
     );
     resp.download_token = stash(
@@ -990,10 +1072,15 @@ async fn archive(
             Ok((resp, out_bytes))
         })
         .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "archive crashed".into()))?;
+        .map_err(|e| {
+            tracing::error!("archive task panicked: {e}");
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "archive crashed".into())
+        })?;
 
-    let (mut resp, out_bytes) =
-        result.map_err(|e| bad_request(format!("could not archive this EPUB: {e}")))?;
+    let (mut resp, out_bytes) = result.map_err(|e| {
+        tracing::warn!("archive failed: {e:#}");
+        bad_request(format!("could not archive this EPUB: {e}"))
+    })?;
 
     resp.download_token = stash(
         &state,
@@ -1112,10 +1199,15 @@ async fn restore(
             Ok((resp, out_bytes))
         })
         .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "restore crashed".into()))?;
+        .map_err(|e| {
+            tracing::error!("restore task panicked: {e}");
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "restore crashed".into())
+        })?;
 
-    let (mut resp, out_bytes) =
-        result.map_err(|e| bad_request(format!("could not restore this .eparc: {e}")))?;
+    let (mut resp, out_bytes) = result.map_err(|e| {
+        tracing::warn!("restore failed: {e:#}");
+        bad_request(format!("could not restore this .eparc: {e}"))
+    })?;
 
     resp.download_token = stash(
         &state,
@@ -1249,7 +1341,10 @@ async fn meta_read(
     let md = tokio::task::spawn_blocking(move || read_metadata_from_bytes(&name, &file_bytes))
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "crashed".into()))?
-        .map_err(|e| bad_request(format!("could not read this EPUB: {e}")))?;
+        .map_err(|e| {
+            tracing::warn!("meta read failed: {e:#}");
+            bad_request(format!("could not read this EPUB: {e}"))
+        })?;
     Ok(Json(metadata_json(&md)))
 }
 
@@ -1290,7 +1385,10 @@ async fn meta_enrich(
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "crashed".into()))?
         // `{e:#}` includes the anyhow cause chain (e.g. "… rate limited (HTTP 429) …").
-        .map_err(|e| bad_request(format!("lookup failed: {e:#}")))?;
+        .map_err(|e| {
+            tracing::warn!("meta enrich lookup failed: {e:#}");
+            bad_request(format!("lookup failed: {e:#}"))
+        })?;
 
     // Structured applied/skipped/warnings so the front-end localizes the field
     // names and reasons (see app.js `applyEnrich`).
@@ -1405,7 +1503,10 @@ async fn meta_write(
         })
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "crashed".into()))?
-        .map_err(|e| bad_request(format!("could not save metadata: {e}")))?;
+        .map_err(|e| {
+            tracing::warn!("meta write failed: {e:#}");
+            bad_request(format!("could not save metadata: {e}"))
+        })?;
 
     let (mut resp, out_bytes) = result;
     resp.download_token = stash(

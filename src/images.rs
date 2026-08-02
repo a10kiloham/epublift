@@ -5,7 +5,7 @@ use crate::opf::{ImageChange, ManifestItem};
 use crate::util::{basename, quote, unquote, with_ext};
 use anyhow::Result;
 use image::{ColorType, DynamicImage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -139,6 +139,26 @@ pub fn optimize_images(
         ref_pairs: Vec::new(),
     };
 
+    // At most one manifest item may carry `properties="cover-image"` —
+    // epubcheck rejects duplicates (e.g. `cover.jpg` + `cover_thumb.jpg` both
+    // matching a name heuristic). Prefer the OPF-declared cover id; fall back
+    // to the first name-based match only when no declared id matches any item.
+    let chosen_cover_id: Option<&str> = cover_id
+        .filter(|c| items.iter().any(|i| i.id == *c))
+        .or_else(|| {
+            items
+                .iter()
+                .filter(|i| is_target_media_type(&i.media_type))
+                .find(|i| {
+                    i.id.to_lowercase().contains("cover") || i.href.to_lowercase().contains("cover")
+                })
+                .map(|i| i.id.as_str())
+        });
+
+    // Output hrefs written so far in this run, to disambiguate collisions
+    // (`foo.jpg` and `foo.png` both map to `foo.webp`).
+    let mut produced_hrefs: HashSet<String> = HashSet::new();
+
     for item in items {
         if !is_target_media_type(&item.media_type) {
             continue;
@@ -146,6 +166,16 @@ pub fn optimize_images(
 
         // Hrefs are URL-encoded; decode to obtain the real on-disk path.
         let decoded_href = unquote(&item.href);
+        // The href is attacker-controlled: refuse anything that would resolve
+        // outside the package dir (`..`, absolute paths) — the write/delete
+        // below must never touch files outside the extraction sandbox.
+        if !crate::util::is_contained_path(&decoded_href) {
+            progress(&format!(
+                "  [!] Warning: skipping image with unsafe path: {}",
+                item.href
+            ));
+            continue;
+        }
         let img_path = package_dir.join(&decoded_href);
 
         if !img_path.exists() {
@@ -239,8 +269,14 @@ pub fn optimize_images(
         }
 
         // The output extension/path follow the chosen format (known only now for
-        // the `Best` policy, which selects per image).
-        let new_href = with_ext(&decoded_href, format.extension());
+        // the `Best` policy, which selects per image). Never clobber a file that
+        // already exists in the package or an output produced earlier in this
+        // run (`foo.jpg` + `foo.png` -> `foo.webp` + `foo_2.webp`).
+        let new_href = disambiguate_href(
+            package_dir,
+            &with_ext(&decoded_href, format.extension()),
+            &produced_hrefs,
+        );
         let new_img_path = package_dir.join(&new_href);
         if let Err(e) = fs::write(&new_img_path, &encoded) {
             progress(&format!(
@@ -249,6 +285,7 @@ pub fn optimize_images(
             ));
             continue;
         }
+        produced_hrefs.insert(new_href.clone());
         let _ = fs::remove_file(&img_path);
 
         let pct = (orig_size as i64 - new_size as i64) as f64 / orig_size as f64 * 100.0;
@@ -272,12 +309,8 @@ pub fn optimize_images(
             pct
         ));
 
-        // Determine whether this is the cover image.
-        let id_lower = item.id.to_lowercase();
-        let href_lower = item.href.to_lowercase();
-        let is_cover = cover_id.map(|c| c == item.id).unwrap_or(false)
-            || id_lower.contains("cover")
-            || href_lower.contains("cover");
+        // Only the single item chosen above may be flagged as the cover image.
+        let is_cover = chosen_cover_id == Some(item.id.as_str());
 
         result.manifest_changes.insert(
             item.href.clone(),
@@ -326,6 +359,34 @@ pub fn optimize_to_webp(original: &[u8], quality: u8) -> Option<Vec<u8>> {
 fn push_unique(pairs: &mut Vec<(String, String)>, old: String, new: String) {
     if !pairs.iter().any(|(o, _)| *o == old) {
         pairs.push((old, new));
+    }
+}
+
+/// Insert `_{n}` before the extension of an href's basename
+/// (`img/foo.webp` -> `img/foo_2.webp`).
+fn numbered_href(href: &str, n: usize) -> String {
+    let slash = href.rfind('/').map(|i| i as isize).unwrap_or(-1);
+    match href.rfind('.') {
+        Some(dot) if (dot as isize) > slash => format!("{}_{n}{}", &href[..dot], &href[dot..]),
+        _ => format!("{href}_{n}"),
+    }
+}
+
+/// Pick an output href that collides neither with a file already on disk under
+/// `package_dir` (e.g. a pre-existing `foo.webp` shipped in the source EPUB)
+/// nor with an href produced earlier in this run, appending `_2`, `_3`, … to
+/// the stem until it is free.
+fn disambiguate_href(package_dir: &Path, href: &str, produced: &HashSet<String>) -> String {
+    if !produced.contains(href) && !package_dir.join(href).exists() {
+        return href.to_string();
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = numbered_href(href, n);
+        if !produced.contains(&candidate) && !package_dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -582,7 +643,9 @@ pub fn update_document_references(
             continue;
         }
 
-        let raw = match fs::read(path) {
+        // Work on raw bytes: decoding via `from_utf8_lossy` and writing the
+        // result back would silently corrupt non-UTF-8 (e.g. Latin-1) files.
+        let mut content = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 progress(&format!(
@@ -593,7 +656,6 @@ pub fn update_document_references(
                 continue;
             }
         };
-        let mut content = String::from_utf8_lossy(&raw).into_owned();
         let mut updated = false;
 
         for (old_href, new_href) in ref_pairs {
@@ -602,21 +664,25 @@ pub fn update_document_references(
             let old_encoded = quote(old_href);
             let new_encoded = quote(new_href);
 
-            if content.contains(old_href.as_str()) {
-                content = content.replace(old_href.as_str(), new_href);
-                updated = true;
-            }
-            if content.contains(&old_encoded) {
-                content = content.replace(&old_encoded, &new_encoded);
-                updated = true;
-            }
-            if content.contains(old_name) {
-                content = content.replace(old_name, new_name);
-                updated = true;
+            // Multi-segment hrefs (and their percent-encoded forms) are
+            // replaced exactly. Anything without a directory component is a
+            // bare filename and is only replaced at token boundaries, so an
+            // `a.png` rename never rewrites the tail of `data.png` or mangles
+            // prose/ids/CSS that merely contain the filename as a substring.
+            for (old, new) in [
+                (old_href.as_str(), new_href.as_str()),
+                (old_encoded.as_str(), new_encoded.as_str()),
+                (old_name, new_name),
+            ] {
+                if old.contains('/') {
+                    updated |= replace_bytes(&mut content, old.as_bytes(), new.as_bytes());
+                } else {
+                    updated |= replace_bytes_bounded(&mut content, old.as_bytes(), new.as_bytes());
+                }
             }
         }
 
-        if updated && let Err(e) = fs::write(path, content) {
+        if updated && let Err(e) = fs::write(path, &content) {
             progress(&format!(
                 "  [!] Warning: Failed to update references in {}: {}",
                 path.file_name().unwrap_or_default().to_string_lossy(),
@@ -624,6 +690,54 @@ pub fn update_document_references(
             ));
         }
     }
+}
+
+/// Bytes that can appear inside a filename token. A bare-basename match is
+/// only replaced when the bytes on both sides are *not* token bytes.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'-')
+}
+
+/// Replace every occurrence of `old` with `new` in `content`, returning true
+/// if anything changed.
+fn replace_bytes(content: &mut Vec<u8>, old: &[u8], new: &[u8]) -> bool {
+    replace_bytes_impl(content, old, new, false)
+}
+
+/// Like [`replace_bytes`], but only replaces occurrences delimited by
+/// non-token bytes (or the start/end of the content) on both sides — see
+/// [`is_token_byte`].
+fn replace_bytes_bounded(content: &mut Vec<u8>, old: &[u8], new: &[u8]) -> bool {
+    replace_bytes_impl(content, old, new, true)
+}
+
+fn replace_bytes_impl(content: &mut Vec<u8>, old: &[u8], new: &[u8], bounded: bool) -> bool {
+    if old.is_empty() || old == new || content.len() < old.len() {
+        return false;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < content.len() {
+        if i + old.len() <= content.len() && &content[i..i + old.len()] == old {
+            let before_ok = !bounded || i == 0 || !is_token_byte(content[i - 1]);
+            let after_ok = !bounded
+                || i + old.len() == content.len()
+                || !is_token_byte(content[i + old.len()]);
+            if before_ok && after_ok {
+                out.extend_from_slice(new);
+                i += old.len();
+                changed = true;
+                continue;
+            }
+        }
+        out.push(content[i]);
+        i += 1;
+    }
+    if changed {
+        *content = out;
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -665,5 +779,81 @@ mod tests {
     #[test]
     fn estimate_returns_none_for_non_jpeg() {
         assert!(estimate_jpeg_quality(b"this is not a jpeg at all").is_none());
+    }
+
+    #[test]
+    fn disambiguates_colliding_output_hrefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut produced = HashSet::new();
+
+        // First writer of img/foo.webp keeps the plain name.
+        let first = disambiguate_href(dir.path(), "img/foo.webp", &produced);
+        assert_eq!(first, "img/foo.webp");
+        produced.insert(first);
+
+        // A second image with the same stem (foo.png after foo.jpg) must not
+        // clobber it, and the numbered name goes before the extension.
+        let second = disambiguate_href(dir.path(), "img/foo.webp", &produced);
+        assert_eq!(second, "img/foo_2.webp");
+        produced.insert(second);
+        let third = disambiguate_href(dir.path(), "img/foo.webp", &produced);
+        assert_eq!(third, "img/foo_3.webp");
+
+        // A pre-existing file on disk (shipped in the source EPUB) also forces
+        // a new name, even when nothing was produced this run.
+        fs::create_dir_all(dir.path().join("img")).unwrap();
+        fs::write(dir.path().join("img/bar.webp"), b"old").unwrap();
+        let bumped = disambiguate_href(dir.path(), "img/bar.webp", &HashSet::new());
+        assert_eq!(bumped, "img/bar_2.webp");
+    }
+
+    #[test]
+    fn bounded_replace_leaves_longer_filenames_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("ch1.xhtml");
+        fs::write(
+            &doc,
+            "<img src=\"a.png\"/><img src=\"data.png\"/><p>see a.png and data.png here</p>\
+             <p id=\"nota.pngid\">a.png.bak stays</p>",
+        )
+        .unwrap();
+
+        let pairs = vec![("a.png".to_string(), "a.webp".to_string())];
+        update_document_references(dir.path(), &pairs, &|_| {});
+
+        let out = fs::read_to_string(&doc).unwrap();
+        assert_eq!(
+            out,
+            "<img src=\"a.webp\"/><img src=\"data.png\"/><p>see a.webp and data.png here</p>\
+             <p id=\"nota.pngid\">a.png.bak stays</p>"
+        );
+    }
+
+    #[test]
+    fn non_utf8_document_passes_through_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("ch1.xhtml");
+        // 0xE9 is Latin-1 'é' — invalid UTF-8, must survive untouched.
+        let mut raw = b"<p>caf".to_vec();
+        raw.push(0xE9);
+        raw.extend_from_slice(b" <img src=\"pic.png\"/></p>");
+        fs::write(&doc, &raw).unwrap();
+
+        let pairs = vec![("pic.png".to_string(), "pic.webp".to_string())];
+        update_document_references(dir.path(), &pairs, &|_| {});
+
+        let mut expected = b"<p>caf".to_vec();
+        expected.push(0xE9);
+        expected.extend_from_slice(b" <img src=\"pic.webp\"/></p>");
+        assert_eq!(fs::read(&doc).unwrap(), expected);
+
+        // A file with no matching reference is not rewritten at all.
+        let untouched = dir.path().join("other.xhtml");
+        let mut latin1 = b"<p>r".to_vec();
+        latin1.push(0xE9);
+        latin1.extend_from_slice(b"sum</p>");
+        fs::write(&untouched, &latin1).unwrap();
+        update_document_references(dir.path(), &pairs, &|_| {});
+        assert_eq!(fs::read(&untouched).unwrap(), latin1);
     }
 }

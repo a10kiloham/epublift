@@ -10,6 +10,75 @@ are tagged with the component they belong to.
 
 ## [Unreleased]
 
+### Added
+- **[cli] Smart Import now cleans the OCR text with a second AI pass.** After
+  Mistral OCR, each chunk of pages is sent to a Mistral chat model
+  (`mistral-small-latest`; override with `MISTRAL_CLEANUP_MODEL`, or set it to
+  `off` to skip) with instructions to strip OCR gibberish and errant characters,
+  remove hard-coded page numbers and running headers/footers, and convert
+  footnote markers into linked Markdown footnotes. A chunk whose cleanup fails
+  or looks truncated keeps its raw OCR text, so cleanup can only improve the
+  result, never lose content.
+- **[cli] Markdown import supports footnotes.** `[^1]` references become
+  numbered superscript links, and definitions are rendered as a linked notes
+  section (with backlinks) at the end of the chapter that references them —
+  even when the definition appears later in the document.
+- **[web] Rolling file logs and container healthcheck.** `docker-compose.yml`
+  now mounts `./logs` for the daily log file (level tunable via
+  `EPUBLIFT_FILE_LOG`), bounds `docker logs` growth (json-file rotation), and
+  the image gains a `HEALTHCHECK` probing `/healthz`. Conversion, import,
+  archive, restore, and metadata operations now log start/completion (sizes,
+  options, durations — never filenames or content) and failures server-side.
+
+### Fixed
+- **[cli] Smart Import works again: the Mistral OCR request was rejected with
+  HTTP 400.** The request sent a `document_annotation_format` of type `text`
+  plus a `document_annotation_prompt` field; the OCR API accepts neither (it
+  takes no free-text prompt at all), so every Smart Import failed with
+  `Please provide a json_schema for document_annotation_format`. The request is
+  now a plain OCR call, and the editorial instructions moved to the new chat
+  cleanup pass.
+- **[web] Smart Import is no longer cut off by the global 120 s request
+  timeout.** AI OCR plus cleanup of a whole book takes minutes; `/smart-import`
+  now has its own 30-minute budget (other endpoints keep 120 s), and the
+  provider HTTP timeout was raised to match.
+- **[web] An empty or invalid `RUST_LOG` no longer silently disables logging**
+  — it falls back to the default filter with a note.
+- **[cli] A crafted EPUB can no longer read, overwrite, or delete files outside
+  its extraction sandbox.** OPF manifest image hrefs and the container.xml
+  `full-path` are now validated to stay inside the container before being
+  joined onto filesystem paths.
+- **[cli] Imported EPUBs get a unique `dc:identifier` and a real
+  `dcterms:modified`.** Previously the identifier was derived from the chapter
+  count alone (two 12-chapter books collided, making library apps overwrite one
+  with the other) and the modified timestamp was hard-coded.
+- **[cli] XML non-characters U+FFFE/U+FFFF are stripped from imported text**
+  (they made the output EPUB ill-formed).
+- **[cli] Hardening against crafted uploads across the whole pipeline:**
+  attacker-declared sizes in `.eparc` manifests / ZIP headers / Zstd-OCF
+  central directories can no longer force huge allocations (process abort) —
+  all decompression paths now share a 1 GiB budget; a NaN-coordinate PDF can no
+  longer wedge a worker thread in an infinite loop; a crafted ToUnicode CMap
+  can no longer inflate a few KB into GBs of map entries; a deeply-nested
+  NCX/OPF/container.xml can no longer crash the process via parser recursion
+  (depth-capped before parsing); nav.xhtml generation now XML-escapes NCX
+  titles/hrefs (no more ill-formed output or markup injection); shared PDF
+  image XObjects are extracted once per document (not once per referencing
+  page) under global count/byte caps; concurrent OCR-model downloads no longer
+  race on a shared temp file.
+- **[cli] Correctness fixes:** at most one manifest item is flagged
+  `cover-image` (two `cover*` images used to fail epubcheck); colliding output
+  image names (`foo.jpg` + `foo.png` → `foo.webp`) are disambiguated instead
+  of silently overwritten; reference rewriting is boundary-checked
+  (renaming `a.png` no longer corrupts `data.png` or prose) and byte-based, so
+  non-UTF-8 (e.g. Latin-1) documents are never lossily rewritten — the
+  DOCTYPE/xmlns fixups and kepub span pass now skip such files entirely;
+  single-quoted `xmlns` declarations are recognised (no duplicate attribute);
+  DOCTYPE internal subsets are removed whole (no stray `]>`); editing metadata
+  no longer deletes a nested `dc:title`/`dc:identifier` instead of the real
+  one; archiving an EPUB with duplicate entry names is refused up front
+  (previously produced an archive that could never be restored).
+
 ## [cli-v1.10.1] - 2026-06-30
 
 ### Fixed

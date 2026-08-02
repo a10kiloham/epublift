@@ -27,10 +27,12 @@
 //! rendered chapters to [`crate::epub_writer`] for OCF/OPF/nav packaging.
 //!
 //! Scope (v1): headings, paragraphs, emphasis/strong/strikethrough, inline &
-//! fenced code, lists, blockquotes, tables, links, horizontal rules, and local
-//! image embedding. Raw HTML blocks are dropped (to keep the output valid XHTML);
-//! footnotes and task lists are not enabled yet.
+//! fenced code, lists, blockquotes, tables, links, horizontal rules, local
+//! image embedding, and footnotes (rendered as in-chapter linked notes with
+//! backlinks). Raw HTML blocks are dropped (to keep the output valid XHTML);
+//! task lists are not enabled yet.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -133,12 +135,7 @@ pub fn import_collection(
             .unwrap_or_else(|| PathBuf::from("."));
         r.run(&text);
     }
-    let Renderer {
-        chapters,
-        images,
-        first_h1,
-        ..
-    } = r;
+    let (chapters, images, first_h1) = r.finish();
 
     if chapters.is_empty() {
         bail!("no content found in the markdown input");
@@ -341,6 +338,9 @@ fn extract_markdown_zip(bytes: &[u8], dest: &Path) -> Result<(Vec<PathBuf>, Opti
     Ok((md_files, covers.into_iter().next()))
 }
 
+/// A finished chapter: `(optional title, body XHTML)`.
+type Chapter = (Option<String>, String);
+
 /// A `![alt](url)` being collected: we buffer the alt text, then resolve & embed
 /// (or reference) the image when the tag closes.
 struct PendingImage {
@@ -357,8 +357,8 @@ struct Renderer {
     base_dir: PathBuf,
     /// XHTML accumulated for the current chapter's `<body>`.
     body: String,
-    /// Finished chapters: (optional title, body XHTML).
-    chapters: Vec<(Option<String>, String)>,
+    /// Finished chapters: (optional title, body XHTML, footnote names used).
+    chapters: Vec<(Option<String>, String, Vec<String>)>,
     images: Vec<ImageAsset>,
     /// Title of the chapter currently being built (set from its `#` heading).
     cur_title: Option<String>,
@@ -372,6 +372,15 @@ struct Renderer {
     /// When inside an image, collects its alt text.
     image: Option<PendingImage>,
     in_table_head: bool,
+    /// When inside a footnote definition: its (name, XHTML buffer). Markup and
+    /// text are diverted here instead of the chapter body.
+    cur_footnote: Option<(String, String)>,
+    /// Footnote definitions collected so far: name → rendered XHTML content.
+    footnote_defs: HashMap<String, String>,
+    /// Footnote numbering, in first-reference order across the whole book.
+    footnote_numbers: HashMap<String, usize>,
+    /// Footnotes referenced by the chapter currently being built (first-use order).
+    chapter_refs: Vec<String>,
 }
 
 impl Renderer {
@@ -387,18 +396,31 @@ impl Renderer {
             heading_plain: None,
             image: None,
             in_table_head: false,
+            cur_footnote: None,
+            footnote_defs: HashMap::new(),
+            footnote_numbers: HashMap::new(),
+            chapter_refs: Vec::new(),
+        }
+    }
+
+    /// Where rendered output currently goes: the open footnote definition's
+    /// buffer, or the chapter body.
+    fn sink(&mut self) -> &mut String {
+        match &mut self.cur_footnote {
+            Some((_, buf)) => buf,
+            None => &mut self.body,
         }
     }
 
     /// Push literal XHTML markup (suppressed while collecting an image's alt).
     fn raw(&mut self, s: &str) {
         if self.image.is_none() {
-            self.body.push_str(s);
+            self.sink().push_str(s);
         }
     }
 
     /// Push text content: routed to the image alt or heading-title buffer when
-    /// one is open, and always escaped into the body.
+    /// one is open, and always escaped into the current sink.
     fn text(&mut self, s: &str) {
         if let Some(img) = &mut self.image {
             img.alt.push_str(s);
@@ -407,17 +429,59 @@ impl Renderer {
         if let Some(h) = &mut self.heading_plain {
             h.push_str(s);
         }
-        self.body.push_str(&esc(s));
+        let escaped = esc(s);
+        self.sink().push_str(&escaped);
+    }
+
+    /// Emit a footnote reference: a numbered superscript link to the note. The
+    /// first reference in a chapter also carries the backlink anchor.
+    fn footnote_ref(&mut self, name: &str) {
+        let next = self.footnote_numbers.len() + 1;
+        let n = *self
+            .footnote_numbers
+            .entry(name.to_string())
+            .or_insert(next);
+        let first_in_chapter = !self.chapter_refs.iter().any(|r| r == name);
+        if first_in_chapter {
+            self.chapter_refs.push(name.to_string());
+        }
+        let id_attr = if first_in_chapter {
+            format!(" id=\"fnref-{n}\"")
+        } else {
+            String::new()
+        };
+        let html = format!("<sup class=\"fnref\"><a href=\"#fn-{n}\"{id_attr}>{n}</a></sup>");
+        self.raw(&html);
     }
 
     /// Finalise the current chapter if it has any content.
     fn flush_chapter(&mut self) {
         let body = std::mem::take(&mut self.body);
         let title = self.cur_title.take();
+        let refs = std::mem::take(&mut self.chapter_refs);
         if body.trim().is_empty() {
             return;
         }
-        self.chapters.push((title, body));
+        self.chapters.push((title, body, refs));
+    }
+
+    /// Consume the renderer: appends each chapter's footnotes (as a linked notes
+    /// section at its end) and returns `(chapters, images, first_h1)`.
+    fn finish(mut self) -> (Vec<Chapter>, Vec<ImageAsset>, Option<String>) {
+        self.flush_chapter();
+        let chapters = self
+            .chapters
+            .into_iter()
+            .map(|(title, mut body, refs)| {
+                body.push_str(&footnotes_section(
+                    &refs,
+                    &self.footnote_defs,
+                    &self.footnote_numbers,
+                ));
+                (title, body)
+            })
+            .collect();
+        (chapters, self.images, self.first_h1)
     }
 
     /// Resolve a closed `![alt](url)`: embed a local image, reference a remote
@@ -470,6 +534,7 @@ impl Renderer {
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_TABLES);
         opts.insert(Options::ENABLE_STRIKETHROUGH);
+        opts.insert(Options::ENABLE_FOOTNOTES);
         for event in Parser::new_ext(text, opts) {
             self.handle(event);
         }
@@ -488,16 +553,15 @@ impl Renderer {
                     if let Some(h) = &mut self.heading_plain {
                         h.push_str(&t);
                     }
-                    self.body.push_str("<code>");
-                    self.body.push_str(&esc(&t));
-                    self.body.push_str("</code>");
+                    let html = format!("<code>{}</code>", esc(&t));
+                    self.raw(&html);
                 }
             }
             Event::SoftBreak => {
                 if let Some(img) = &mut self.image {
                     img.alt.push(' ');
                 } else {
-                    self.body.push('\n');
+                    self.raw("\n");
                 }
             }
             Event::HardBreak => self.raw("<br/>\n"),
@@ -505,7 +569,7 @@ impl Renderer {
             // Drop raw HTML to keep the output well-formed XHTML.
             Event::Html(_) | Event::InlineHtml(_) => {}
             Event::TaskListMarker(checked) => self.text(if checked { "[x] " } else { "[ ] " }),
-            Event::FootnoteReference(_) => {}
+            Event::FootnoteReference(name) => self.footnote_ref(&name),
             // Math isn't enabled; if it ever appears, keep the source as text.
             Event::InlineMath(t) | Event::DisplayMath(t) => self.text(&t),
         }
@@ -516,7 +580,7 @@ impl Renderer {
             Tag::Paragraph => self.raw("<p>"),
             Tag::Heading { level, .. } => {
                 let n = h_num(level);
-                if n == 1 && self.depth == 0 {
+                if n == 1 && self.depth == 0 && self.cur_footnote.is_none() {
                     self.flush_chapter();
                 }
                 self.raw(&format!("<h{n}>"));
@@ -578,8 +642,14 @@ impl Renderer {
                 self.depth += 1;
                 self.raw(if self.in_table_head { "<th>" } else { "<td>" });
             }
-            // Raw HTML blocks, footnote defs, metadata blocks: ignored (their
-            // inner Text/Html events are dropped too).
+            Tag::FootnoteDefinition(name) => {
+                // Divert the definition's content into its own buffer; it is
+                // appended (numbered + backlinked) to the chapters that
+                // reference it when the renderer finishes.
+                self.cur_footnote = Some((name.to_string(), String::new()));
+            }
+            // Raw HTML blocks, metadata blocks: ignored (their inner Text/Html
+            // events are dropped too).
             _ => {}
         }
     }
@@ -636,9 +706,56 @@ impl Renderer {
                 self.depth = self.depth.saturating_sub(1);
                 self.raw(if self.in_table_head { "</th>" } else { "</td>" });
             }
+            TagEnd::FootnoteDefinition => {
+                if let Some((name, buf)) = self.cur_footnote.take() {
+                    // Last definition wins on duplicate names (matches how
+                    // readers resolve them).
+                    self.footnote_defs.insert(name, buf);
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Render a chapter's footnotes as a linked notes section: each note carries
+/// its number (a backlink to the reference) followed by the definition's
+/// content. Notes are ordered by number; a reference whose definition never
+/// appeared gets a stub so the `#fn-N` link still resolves.
+fn footnotes_section(
+    refs: &[String],
+    defs: &HashMap<String, String>,
+    numbers: &HashMap<String, usize>,
+) -> String {
+    if refs.is_empty() {
+        return String::new();
+    }
+    let mut notes: Vec<(&str, usize)> = refs
+        .iter()
+        .map(|name| (name.as_str(), numbers[name]))
+        .collect();
+    notes.sort_by_key(|(_, n)| *n);
+
+    let mut s = String::from("<hr/>\n<section class=\"footnotes\">\n");
+    for (name, n) in notes {
+        let marker = format!("<a class=\"fnmark\" href=\"#fnref-{n}\">{n}</a>.&#160;");
+        let def = defs.get(name).map(String::as_str).unwrap_or("").trim();
+        let content = if def.is_empty() {
+            // No definition anywhere in the input: keep the marker text so the
+            // note isn't silently empty.
+            format!("<p>{marker}{}</p>\n", esc(name))
+        } else if let Some(rest) = def.strip_prefix("<p>") {
+            // Fold the marker into the definition's first paragraph.
+            format!("<p>{marker}{rest}\n")
+        } else {
+            format!("<p>{marker}</p>\n{def}\n")
+        };
+        s.push_str(&format!(
+            "<div class=\"footnote\" id=\"fn-{n}\">\n{content}</div>\n"
+        ));
+    }
+    s.push_str("</section>\n");
+    s
 }
 
 fn h_num(level: HeadingLevel) -> u8 {
@@ -826,6 +943,50 @@ mod tests {
         assert!(read_entry(&out, "OEBPS/ch002.xhtml").contains("beta body"));
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn footnotes_are_linked_within_a_chapter() {
+        let r = render("# T\n\nHe said so[^1].\n\n[^1]: The citation.\n");
+        let (chapters, _images, _h1) = r.finish();
+        assert_eq!(chapters.len(), 1);
+        let body = &chapters[0].1;
+        // Reference: superscript link to the note, with a backlink anchor.
+        assert!(body.contains("<sup class=\"fnref\"><a href=\"#fn-1\" id=\"fnref-1\">1</a></sup>"));
+        // Note: numbered, backlinked, holding the definition text.
+        assert!(body.contains("<div class=\"footnote\" id=\"fn-1\">"));
+        assert!(body.contains("<a class=\"fnmark\" href=\"#fnref-1\">1</a>"));
+        assert!(body.contains("The citation."));
+        // The definition's content must not leak into the chapter prose.
+        let notes_at = body.find("<section class=\"footnotes\">").unwrap();
+        assert!(!body[..notes_at].contains("The citation."));
+    }
+
+    #[test]
+    fn footnote_defined_in_a_later_chapter_lands_where_referenced() {
+        let md = "# One\n\nalpha[^a].\n\n# Two\n\nbeta.\n\n[^a]: the note.\n";
+        let mut r = Renderer::new();
+        r.run(md);
+        let (chapters, _images, _h1) = r.finish();
+        assert_eq!(chapters.len(), 2);
+        // The note is appended to chapter One (where it's referenced) even
+        // though its definition appears after chapter Two began.
+        assert!(chapters[0].1.contains("the note."));
+        assert!(chapters[0].1.contains("id=\"fn-1\""));
+        assert!(!chapters[1].1.contains("the note."));
+    }
+
+    #[test]
+    fn footnote_numbering_follows_reference_order() {
+        let r = render("# T\n\nfirst[^b] then[^a].\n\n[^a]: A.\n\n[^b]: B.\n");
+        let (chapters, _images, _h1) = r.finish();
+        let body = &chapters[0].1;
+        // [^b] is referenced first, so it becomes note 1.
+        let b_pos = body.find("B.").unwrap();
+        let a_pos = body.find("A.").unwrap();
+        assert!(b_pos < a_pos);
+        assert!(body.contains("href=\"#fn-1\""));
+        assert!(body.contains("href=\"#fn-2\""));
     }
 
     #[test]

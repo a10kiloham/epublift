@@ -38,5 +38,10 @@ COPY --from=builder /app/target/release/epublift-web /usr/local/bin/epublift-web
 USER epublift
 EXPOSE 8080
 
+# Container-native liveness probe (busybox wget ships with Alpine). Docker,
+# Compose, and orchestrators surface this as the container's health status.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+
 # The service writes only to the system temp dir (mount it as tmpfs at runtime).
 ENTRYPOINT ["/usr/local/bin/epublift-web"]

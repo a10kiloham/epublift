@@ -12,7 +12,8 @@
 //! TODO: extract the largest image per page verbatim (for figures) — ported
 //! from the spike's `extract-images`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Encoding, Object, ObjectId};
@@ -82,6 +83,12 @@ fn push_run(runs: &mut Vec<TextRun>, tm: Mat, ctm: Mat, font_size: f32, text: St
     let yscale = (m[2] * m[2] + m[3] * m[3]).sqrt();
     let xscale = (m[0] * m[0] + m[1] * m[1]).sqrt();
     let width = adv_em * font_size * xscale;
+    // Malformed content streams can yield non-finite coordinates (over-long
+    // numeric literals parse as inf, and inf × 0 = NaN in the matrix math);
+    // such runs would poison the y-clustering downstream, so drop them here.
+    if !m[4].is_finite() || !m[5].is_finite() || !width.is_finite() || !yscale.is_finite() {
+        return;
+    }
     runs.push(TextRun {
         text,
         font_size: font_size * yscale,
@@ -210,8 +217,10 @@ fn font_widths(doc: &Document, dict: &Dictionary, subtype: &str) -> (HashMap<u32
                 // form 1: c [w1 w2 …]   form 2: cFirst cLast w
                 if let Some(arr) = w.get(i + 1).and_then(|o| o.as_array().ok()) {
                     for (j, wv) in arr.iter().enumerate() {
-                        if let Ok(wf) = wv.as_float() {
-                            widths.insert(c as u32 + j as u32, wf / 1000.0);
+                        if let (Ok(wf), Some(code)) =
+                            (wv.as_float(), (c as u32).checked_add(j as u32))
+                        {
+                            widths.insert(code, wf / 1000.0);
                         }
                     }
                     i += 2;
@@ -219,7 +228,7 @@ fn font_widths(doc: &Document, dict: &Dictionary, subtype: &str) -> (HashMap<u32
                     w.get(i + 1).and_then(|o| o.as_i64().ok()),
                     w.get(i + 2).and_then(|o| o.as_float().ok()),
                 ) {
-                    for code in c..=clast.min(c + 65535) {
+                    for code in c..=clast.min(c.saturating_add(65535)) {
                         widths.insert(code as u32, wv / 1000.0);
                     }
                     i += 3;
@@ -243,7 +252,7 @@ fn font_widths(doc: &Document, dict: &Dictionary, subtype: &str) -> (HashMap<u32
         {
             for (i, wv) in arr.iter().enumerate() {
                 if let Ok(wf) = wv.as_float() {
-                    widths.insert((first + i as i64) as u32, wf / 1000.0);
+                    widths.insert(first.saturating_add(i as i64) as u32, wf / 1000.0);
                 }
             }
         }
@@ -407,6 +416,10 @@ fn parse_to_unicode(content: &[u8]) -> Option<(HashMap<u32, String>, usize)> {
         }
     }
 
+    // Cap the total map size: without it a few bytes of `beginbfrange` can
+    // inflate to 65536 entries each, and a small compressed CMap to gigabytes.
+    // Generous for any real font; once hit we silently stop inserting.
+    const MAX_MAP_ENTRIES: usize = 1_000_000;
     let mut map = HashMap::new();
     let mut src_hex_len = 0usize;
     let mut k = 0;
@@ -419,7 +432,9 @@ fn parse_to_unicode(content: &[u8]) -> Option<(HashMap<u32, String>, usize)> {
                         break;
                     };
                     src_hex_len = src_hex_len.max(src.len());
-                    if let (Some(code), Some(text)) = (hex_u32(src), hex_string(dst)) {
+                    if let (Some(code), Some(text)) = (hex_u32(src), hex_string(dst))
+                        && map.len() < MAX_MAP_ENTRIES
+                    {
                         map.insert(code, text);
                     }
                     k += 2;
@@ -441,8 +456,16 @@ fn parse_to_unicode(content: &[u8]) -> Option<(HashMap<u32, String>, usize)> {
                     k += 2;
                     match &toks[k] {
                         Tok::Hex(dst) => {
-                            if let Some(units) = hex_units(dst) {
-                                for (off, code) in (lo..=hi.min(lo + 65535)).enumerate() {
+                            let room = MAX_MAP_ENTRIES.saturating_sub(map.len());
+                            if let Some(units) = hex_units(dst)
+                                && room > 0
+                            {
+                                // Clamp the span to 64K and to what remains
+                                // under the total-entry cap.
+                                let hi = hi
+                                    .min(lo.saturating_add(65535))
+                                    .min(lo.saturating_add(room as u32 - 1));
+                                for (off, code) in (lo..=hi).enumerate() {
                                     let mut u = units.clone();
                                     if let Some(last) = u.last_mut() {
                                         *last = last.wrapping_add(off as u16);
@@ -458,8 +481,10 @@ fn parse_to_unicode(content: &[u8]) -> Option<(HashMap<u32, String>, usize)> {
                             while k < toks.len() {
                                 match &toks[k] {
                                     Tok::Hex(d) => {
-                                        if let Some(t) = hex_string(d) {
-                                            map.insert(lo + off, t);
+                                        if let Some(t) = hex_string(d)
+                                            && map.len() < MAX_MAP_ENTRIES
+                                        {
+                                            map.insert(lo.saturating_add(off), t);
                                         }
                                         off += 1;
                                         k += 1;
@@ -701,10 +726,60 @@ pub(crate) struct Figure {
     pub ext: &'static str,
 }
 
+/// Per-document figure-extraction caps: an untrusted PDF must not be able to
+/// blow up memory by referencing one big image XObject from thousands of pages
+/// (dedup, see [`FigureBudget`]) or by carrying thousands of distinct images
+/// (count/byte budget). Beyond the caps further figures are skipped — the book
+/// still imports, just without those images.
+const MAX_FIGURES_PER_DOC: usize = 512;
+const MAX_FIGURE_BYTES_PER_DOC: usize = 256 * 1024 * 1024; // 256 MiB
+
+/// Cross-page figure state. `page_figures` is called per page with no
+/// document-level context to thread state through (its signature is fixed by
+/// `super`), so the dedup set and budget live in a thread-local keyed by the
+/// Document's address. [`born_digital_doc`] — called once per document before
+/// any figure extraction — resets it explicitly; a key mismatch (a different
+/// Document on this thread, e.g. in tests) resets it implicitly.
+struct FigureBudget {
+    doc_key: usize,
+    /// Image XObjects already handled — a shared XObject is emitted only on
+    /// its first referencing page. Failures are recorded too, so a broken
+    /// stream isn't re-decoded for every page that references it.
+    seen: HashSet<ObjectId>,
+    count: usize,
+    bytes: usize,
+}
+
+thread_local! {
+    static FIGURE_BUDGET: RefCell<FigureBudget> = RefCell::new(FigureBudget {
+        doc_key: 0,
+        seen: HashSet::new(),
+        count: 0,
+        bytes: 0,
+    });
+}
+
+fn doc_key(doc: &Document) -> usize {
+    std::ptr::from_ref(doc) as usize
+}
+
+fn reset_figure_budget(doc: &Document) {
+    FIGURE_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        b.doc_key = doc_key(doc);
+        b.seen.clear();
+        b.count = 0;
+        b.bytes = 0;
+    });
+}
+
 /// True for a born-digital document (most pages are text, not full-page
 /// images). Such a doc's full-page images are real illustrations worth keeping;
 /// a searchable-scan doc's full-page images ARE the pages, so we don't.
 pub(crate) fn born_digital_doc(doc: &Document) -> bool {
+    // Called once per document before any page's figures are extracted — the
+    // natural point to reset the per-document figure dedup/budget state.
+    reset_figure_budget(doc);
     let pages = doc.get_pages();
     if pages.is_empty() {
         return false;
@@ -794,12 +869,14 @@ pub(crate) fn page_scan_image(doc: &Document, page_id: ObjectId) -> Option<Figur
             .ok()
             .and_then(|o| o.as_i64().ok())
             .unwrap_or(0)
-            * stream
-                .dict
-                .get(b"Height")
-                .ok()
-                .and_then(|o| o.as_i64().ok())
-                .unwrap_or(0);
+            .saturating_mul(
+                stream
+                    .dict
+                    .get(b"Height")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(0),
+            );
         if best.as_ref().map(|(_, a)| area > *a).unwrap_or(true) {
             best = Some((stream, area));
         }
@@ -822,25 +899,46 @@ fn page_figures(doc: &Document, page_id: ObjectId) -> Vec<Figure> {
     else {
         return out;
     };
-    for (_name, val) in xobjects.iter() {
-        let Object::Reference(id) = val else { continue };
-        let Ok(stream) = doc.get_object(*id).and_then(|o| o.as_stream()) else {
-            continue;
-        };
-        let is_image = stream
-            .dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name().ok())
-            .map(|n| n == b"Image")
-            .unwrap_or(false);
-        if !is_image {
-            continue;
+    FIGURE_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.doc_key != doc_key(doc) {
+            b.doc_key = doc_key(doc);
+            b.seen.clear();
+            b.count = 0;
+            b.bytes = 0;
         }
-        if let Some(fig) = figure_from_stream(doc, stream) {
-            out.push(fig);
+        for (_name, val) in xobjects.iter() {
+            let Object::Reference(id) = val else { continue };
+            if b.count >= MAX_FIGURES_PER_DOC || b.bytes >= MAX_FIGURE_BYTES_PER_DOC {
+                break; // over budget — skip the document's remaining figures
+            }
+            // Shared XObjects appear on many pages; handle each exactly once.
+            if !b.seen.insert(*id) {
+                continue;
+            }
+            let Ok(stream) = doc.get_object(*id).and_then(|o| o.as_stream()) else {
+                continue;
+            };
+            let is_image = stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| n == b"Image")
+                .unwrap_or(false);
+            if !is_image {
+                continue;
+            }
+            if let Some(fig) = figure_from_stream(doc, stream) {
+                if b.bytes.saturating_add(fig.data.len()) > MAX_FIGURE_BYTES_PER_DOC {
+                    continue;
+                }
+                b.count += 1;
+                b.bytes += fig.data.len();
+                out.push(fig);
+            }
         }
-    }
+    });
     out
 }
 
@@ -870,24 +968,53 @@ fn figure_from_stream(doc: &Document, stream: &lopdf::Stream) -> Option<Figure> 
     }
 }
 
+// Decode guards mirroring the limits in src/images.rs (private consts there,
+// not importable): reject absurd declared dimensions before decompressing or
+// allocating a pixel buffer.
+const MAX_IMAGE_DIM: u32 = 16_384;
+const MAX_IMAGE_ALLOC: u64 = 512 * 1024 * 1024; // 512 MiB
+
+/// Expected raw pixel-buffer length for an 8-bit image, with overflow-checked
+/// arithmetic. None when a dimension or the total allocation exceeds the caps.
+fn raw_pixel_len(w: u32, h: u32, comps: usize) -> Option<usize> {
+    if w == 0 || h == 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
+        return None;
+    }
+    let len = (w as u64)
+        .checked_mul(h as u64)?
+        .checked_mul(comps as u64)?;
+    if len > MAX_IMAGE_ALLOC {
+        return None;
+    }
+    usize::try_from(len).ok()
+}
+
 /// Encode a raw 8-bit DeviceGray/DeviceRGB image stream to PNG.
 fn raw_to_png(doc: &Document, stream: &lopdf::Stream) -> Option<Figure> {
     let dict = &stream.dict;
-    let w = dict.get(b"Width").ok()?.as_i64().ok()? as u32;
-    let h = dict.get(b"Height").ok()?.as_i64().ok()? as u32;
+    // try_from, not `as`: a declared width of 2^32+1 must be rejected, not
+    // silently truncated to 1.
+    let w = u32::try_from(dict.get(b"Width").ok()?.as_i64().ok()?).ok()?;
+    let h = u32::try_from(dict.get(b"Height").ok()?.as_i64().ok()?).ok()?;
     let bpc = dict
         .get(b"BitsPerComponent")
         .ok()
         .and_then(|o| o.as_i64().ok())
         .unwrap_or(8);
-    if bpc != 8 || w == 0 || h == 0 {
+    if bpc != 8 {
         return None;
     }
     let comps = image_components(doc, dict)?;
-    let data = stream.decompressed_content().ok()?;
-    if data.len() < (w as usize) * (h as usize) * comps {
+    // Validate the declared geometry BEFORE decoding — a few-KB FlateDecode
+    // stream declaring huge dimensions must not inflate hundreds of MB.
+    let expected = raw_pixel_len(w, h, comps)?;
+    let mut data = stream.decompressed_content().ok()?;
+    // Raw 8-bit samples are exactly Width×Height×comps bytes; allow a little
+    // trailing slack (stray EOLs) but skip on gross mismatch either way.
+    if data.len() < expected || data.len() - expected > 4096 {
         return None;
     }
+    data.truncate(expected);
     let mut png = Vec::new();
     let cursor = &mut std::io::Cursor::new(&mut png);
     let ok = match comps {
@@ -963,7 +1090,11 @@ fn blocks_from_runs(p: &PageContent) -> Vec<String> {
     while i < runs.len() {
         let y0 = runs[i].y;
         let tol = runs[i].font_size.max(1.0) * 0.6;
-        let mut group: Vec<&TextRun> = Vec::new();
+        // Seed the group with runs[i] unconditionally so `i` always advances —
+        // a NaN y would fail the tolerance check even against itself and spin
+        // the outer loop forever.
+        let mut group: Vec<&TextRun> = vec![runs[i]];
+        i += 1;
         while i < runs.len() && (y0 - runs[i].y).abs() <= tol {
             group.push(runs[i]);
             i += 1;
@@ -1119,12 +1250,14 @@ fn has_full_page_image(doc: &Document, page_id: ObjectId) -> bool {
             .ok()
             .and_then(|o| o.as_i64().ok())
             .unwrap_or(0)
-            * stream
-                .dict
-                .get(b"Height")
-                .ok()
-                .and_then(|o| o.as_i64().ok())
-                .unwrap_or(0);
+            .saturating_mul(
+                stream
+                    .dict
+                    .get(b"Height")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(0),
+            );
         if area > 400_000 {
             return true; // ~ a full page of pixels
         }
@@ -1153,6 +1286,8 @@ pub(crate) fn classify(doc: &Document) -> InputKind {
 
 #[cfg(test)]
 mod tests {
+    use lopdf::dictionary;
+
     use super::*;
 
     #[test]
@@ -1199,5 +1334,117 @@ endcmap";
     #[test]
     fn empty_cmap_is_none() {
         assert!(parse_to_unicode(b"begincmap endcmap").is_none());
+    }
+
+    #[test]
+    fn bfrange_near_u32_max_does_not_overflow() {
+        // lo + 65535 would overflow u32 here; the clamp must saturate instead.
+        let (map, _) =
+            parse_to_unicode(b"beginbfrange <FFFFFFF0> <FFFFFFFF> <0041> endbfrange").unwrap();
+        assert_eq!(map.len(), 16);
+    }
+
+    #[test]
+    fn non_finite_runs_are_dropped_and_grouping_terminates() {
+        // push_run: an inf/NaN translation must not produce a TextRun at all.
+        let mut runs = Vec::new();
+        push_run(
+            &mut runs,
+            [1.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            IDENTITY,
+            12.0,
+            "x".to_string(),
+            1.0,
+        );
+        assert!(runs.is_empty(), "non-finite coordinates are dropped");
+
+        // blocks_from_runs: even a NaN y (defence in depth) must not stall the
+        // line-grouping loop — it used to spin forever on such a run.
+        let page = PageContent {
+            width: 612.0,
+            height: 792.0,
+            runs: vec![TextRun {
+                text: "x".to_string(),
+                font_size: 12.0,
+                x: 0.0,
+                end_x: 6.0,
+                y: f32::NAN,
+            }],
+        };
+        let _ = blocks_from_runs(&page);
+    }
+
+    #[test]
+    fn raw_pixel_len_enforces_caps() {
+        // Within caps: 16384×16384 gray is the largest allowed gray image.
+        assert_eq!(raw_pixel_len(16_384, 16_384, 1), Some(16_384 * 16_384usize));
+        // Any dimension over MAX_IMAGE_DIM is rejected outright.
+        assert!(raw_pixel_len(16_385, 1, 1).is_none());
+        assert!(raw_pixel_len(10, 100_000, 3).is_none());
+        // 16384×16384 RGB = 768 MiB — over MAX_IMAGE_ALLOC.
+        assert!(raw_pixel_len(16_384, 16_384, 3).is_none());
+        assert!(raw_pixel_len(0, 10, 1).is_none());
+    }
+
+    #[test]
+    fn raw_to_png_rejects_oversized_or_lying_dimensions() {
+        let doc = Document::with_version("1.5");
+        let huge = lopdf::Stream::new(
+            dictionary! {
+                "Width" => 100_000,
+                "Height" => 100_000,
+                "BitsPerComponent" => 8,
+                "ColorSpace" => "DeviceGray",
+            },
+            vec![0u8; 16],
+        );
+        assert!(
+            raw_to_png(&doc, &huge).is_none(),
+            "declared 100k×100k must be rejected before any decode"
+        );
+
+        // A width past u32::MAX must fail try_from, not wrap to a small value
+        // that makes the buffer-size check pass.
+        let wrap = lopdf::Stream::new(
+            dictionary! {
+                "Width" => 4_294_967_297i64, // 2^32 + 1
+                "Height" => 1,
+                "BitsPerComponent" => 8,
+                "ColorSpace" => "DeviceGray",
+            },
+            vec![0u8; 16],
+        );
+        assert!(raw_to_png(&doc, &wrap).is_none());
+    }
+
+    #[test]
+    fn shared_xobject_extracted_once_per_document() {
+        let mut doc = Document::with_version("1.5");
+        // A DCTDecode image XObject is carried verbatim, so any bytes do.
+        let img = doc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Subtype" => "Image",
+                "Width" => 10,
+                "Height" => 10,
+                "Filter" => "DCTDecode",
+            },
+            vec![0xFF, 0xD8, 0xFF, 0xE0],
+        ));
+        let mut page = |doc: &mut Document| {
+            doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => img },
+                },
+            })
+        };
+        let p1 = page(&mut doc);
+        let p2 = page(&mut doc);
+        reset_figure_budget(&doc);
+        assert_eq!(page_figures(&doc, p1).len(), 1);
+        assert!(
+            page_figures(&doc, p2).is_empty(),
+            "an XObject shared across pages is materialised only once"
+        );
     }
 }

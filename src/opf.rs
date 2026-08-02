@@ -96,6 +96,10 @@ fn get_attr(e: &BytesStart, key: &str) -> Option<String> {
 /// Read-only pass over the OPF gathering manifest, cover, navigation and guide
 /// information.
 pub fn parse_opf_info(xml: &str) -> Result<OpfInfo> {
+    // Bound nesting before the recursive parse (stack-overflow guard).
+    if !crate::util::xml_nesting_ok(xml, 256) {
+        anyhow::bail!("OPF package document is nested too deeply");
+    }
     let doc = roxmltree::Document::parse(xml).context("Failed to parse OPF package document")?;
 
     // Cover image id: <meta name="cover" content="..."/> anywhere in metadata.
@@ -369,6 +373,13 @@ pub fn rewrite_opf(xml: &str, params: &RewriteParams) -> Result<String> {
 
     loop {
         let ev = reader.read_event()?;
+
+        // The skip flags below `continue` past the main match — but must never
+        // skip Eof itself, or an input that ends inside a skipped subtree
+        // would loop forever (quick-xml keeps returning Ok(Eof)).
+        if matches!(ev, Event::Eof) {
+            break;
+        }
 
         // Drop an existing <meta property="dcterms:modified"> element entirely.
         if skip_until_end_meta {

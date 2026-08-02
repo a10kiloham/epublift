@@ -166,7 +166,11 @@ impl RustlsHttp {
         max_body: usize,
     ) -> Result<(u16, Vec<u8>)> {
         use std::time::Duration;
-        const IO_TIMEOUT: Duration = Duration::from_secs(180);
+        // Generous: an OCR call for a large book can take several minutes
+        // before the first response byte arrives. The timeout is per read/write
+        // syscall, so a silent peer is still cut off — it just isn't tripped by
+        // a slow-but-working API.
+        const IO_TIMEOUT: Duration = Duration::from_secs(600);
 
         let (host, path) = parse_https_url(url)?;
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())

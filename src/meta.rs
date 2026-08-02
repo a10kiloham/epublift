@@ -92,6 +92,10 @@ fn attr_local(n: roxmltree::Node, name: &str) -> Option<String> {
 
 /// Read all bibliographic metadata from an OPF package document.
 pub fn parse_metadata(xml: &str) -> Result<Metadata> {
+    // Bound nesting before the recursive parse (stack-overflow guard).
+    if !crate::util::xml_nesting_ok(xml, 256) {
+        anyhow::bail!("OPF package document is nested too deeply");
+    }
     let doc = roxmltree::Document::parse(xml).context("Failed to parse OPF package document")?;
     let pkg = doc.root_element();
 
@@ -529,6 +533,10 @@ struct DropPlan {
 }
 
 fn build_drop_plan(xml: &str, update: &MetadataUpdate) -> Result<DropPlan> {
+    // Bound nesting before the recursive parse (stack-overflow guard).
+    if !crate::util::xml_nesting_ok(xml, 256) {
+        anyhow::bail!("OPF package document is nested too deeply");
+    }
     let doc = roxmltree::Document::parse(xml).context("Failed to parse OPF package document")?;
     let mut plan = DropPlan::default();
     let mut tag = |present: bool, name: &str| {
@@ -776,6 +784,12 @@ pub fn apply_update(xml: &str, update: &MetadataUpdate, modified_ts: &str) -> Re
     let mut skip_depth: u32 = 0;
     let mut title_counter: usize = 0;
     let mut ident_counter: usize = 0;
+    // Open-element depth of written output; `metadata_depth` is the depth at
+    // which `<metadata>` starts, so a direct child's Start/Empty fires at
+    // `metadata_depth + 1`. Keeps the drop counters aligned with
+    // `build_drop_plan`, which enumerates only direct children.
+    let mut depth: u32 = 0;
+    let mut metadata_depth: u32 = 0;
 
     loop {
         match reader
@@ -791,10 +805,12 @@ pub fn apply_update(xml: &str, update: &MetadataUpdate, modified_ts: &str) -> Re
                 if name == "metadata" {
                     in_metadata = true;
                     metadata_seen = true;
+                    metadata_depth = depth;
+                    depth += 1;
                     writer.write_event(Event::Start(e))?;
                     continue;
                 }
-                if in_metadata {
+                if in_metadata && depth == metadata_depth + 1 {
                     let drop = if name == "meta" {
                         should_drop_meta(&e, &plan)
                     } else {
@@ -805,6 +821,7 @@ pub fn apply_update(xml: &str, update: &MetadataUpdate, modified_ts: &str) -> Re
                         continue;
                     }
                 }
+                depth += 1;
                 writer.write_event(Event::Start(e))?;
             }
             Event::Empty(e) => {
@@ -812,7 +829,7 @@ pub fn apply_update(xml: &str, update: &MetadataUpdate, modified_ts: &str) -> Re
                     continue;
                 }
                 let name = local_name(e.name());
-                if in_metadata {
+                if in_metadata && depth == metadata_depth + 1 {
                     let drop = if name == "meta" {
                         should_drop_meta(&e, &plan)
                     } else {
@@ -829,6 +846,7 @@ pub fn apply_update(xml: &str, update: &MetadataUpdate, modified_ts: &str) -> Re
                     skip_depth -= 1;
                     continue;
                 }
+                depth = depth.saturating_sub(1);
                 if in_metadata && local_name(e.name()) == "metadata" {
                     let injected = build_injected(update, modified_ts);
                     writer.get_mut().extend_from_slice(injected.as_bytes());
@@ -988,6 +1006,31 @@ mod tests {
                 .iter()
                 .any(|t| t.value == "Bir Alt Başlık" && t.title_type.as_deref() == Some("subtitle"))
         );
+    }
+
+    #[test]
+    fn set_title_ignores_nested_titles() {
+        // A dc:title nested inside a wrapper element is NOT a metadata entry:
+        // only the direct child "B" may be replaced, and the drop plan and the
+        // streaming pass must agree on its index.
+        let xml = r##"<?xml version="1.0"?>
+<package version="3.0" unique-identifier="bookid" xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:12345</dc:identifier>
+    <x><dc:title>A</dc:title></x>
+    <dc:title>B</dc:title>
+  </metadata>
+</package>"##;
+        let update = MetadataUpdate {
+            title: Some("Yeni Başlık".to_string()),
+            ..MetadataUpdate::default()
+        };
+        let out = apply_update(xml, &update, "2026-06-22T10:00:00Z").unwrap();
+        // The direct child was replaced by the new title, exactly once.
+        assert_eq!(out.matches("Yeni Başlık").count(), 1);
+        assert!(!out.contains(">B<"));
+        // The nested title is untouched.
+        assert!(out.contains("<x><dc:title>A</dc:title></x>"));
     }
 
     #[test]

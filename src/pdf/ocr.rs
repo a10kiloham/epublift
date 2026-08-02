@@ -9,6 +9,7 @@
 //! over the same pure-Rust rustls client used for metadata enrichment.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
@@ -54,6 +55,10 @@ pub(crate) fn load_engine() -> Result<OcrEngine> {
     .map_err(|e| anyhow!("ocrs engine init failed: {e}"))
 }
 
+/// Distinguishes concurrent downloads' temp files within this process (the
+/// process id distinguishes across processes) — see [`download_models`].
+static DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Fetch the OCR models (~12 MB) into `dir` over the pure-Rust HTTPS client.
 fn download_models(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)
@@ -69,11 +74,24 @@ fn download_models(dir: &Path) -> Result<()> {
         let bytes = http
             .get_bytes(&url)
             .with_context(|| format!("downloading {name}"))?;
-        // Write to a temp name then rename, so an interrupted download can't
-        // leave a half-written model that looks valid.
-        let tmp = path.with_extension("rten.part");
+        // The model bucket publishes no size/hash to verify against, so the
+        // best integrity check available is rejecting an empty body.
+        if bytes.is_empty() {
+            return Err(anyhow!("downloaded {name} is empty"));
+        }
+        // Write to a temp path unique to this process+call, then atomically
+        // rename into place: concurrent first-time requests each write their
+        // own file instead of interleaving on one shared .part path (which
+        // could publish a truncated/mixed model that poisons every later
+        // request). Rename-over-existing is fine — last complete file wins —
+        // and an interrupted download never leaves a half-written model.
+        let seq = DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("{name}.{}-{seq}.part", std::process::id()));
         std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("publishing {}", path.display()));
+        }
     }
     Ok(())
 }
